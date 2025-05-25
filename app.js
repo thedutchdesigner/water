@@ -1,4 +1,4 @@
-// app.js with improved AR support, map bug fixes, and performance enhancements
+// app.js with major performance optimizations
 
 // Pure Leaflet + CartoDB Positron minimal tiles
 const map = L.map('map').setView([0, 0], 2);
@@ -7,15 +7,19 @@ L.tileLayer(
   { maxZoom: 19, attribution: '© OpenStreetMap contributors © CartoDB' }
 ).addTo(map);
 
-// Marker cluster group with improved settings
+// PERFORMANCE: Optimized marker cluster with static settings
 const markersCluster = L.markerClusterGroup({ 
-  maxClusterRadius: 60,
+  maxClusterRadius: 50, // Static value - no dynamic calculation
   spiderfyOnMaxZoom: true,
   showCoverageOnHover: false,
   zoomToBoundsOnClick: true,
-  maxClusterRadius: function(zoom) {
-    // Dynamic cluster radius based on zoom level
-    return zoom < 10 ? 80 : zoom < 15 ? 60 : 40;
+  disableClusteringAtZoom: 18, // Disable clustering at high zoom
+  chunkedLoading: true, // Enable chunked loading for better performance
+  chunkProgress: function(processed, total) {
+    // Optional: show loading progress for large datasets
+    if (processed === total) {
+      hideLoadingIndicator();
+    }
   }
 });
 map.addLayer(markersCluster);
@@ -23,6 +27,11 @@ map.addLayer(markersCluster);
 // Location marker
 let locationMarker;
 let userLocation = null;
+
+// PERFORMANCE: Request management
+let currentFetchController = null;
+let lastFetchBounds = null;
+const MIN_ZOOM_FOR_FETCH = 10; // Don't fetch at very low zoom levels
 
 // Improved location handling
 function initializeLocation() {
@@ -37,7 +46,6 @@ function initializeLocation() {
 map.on('locationerror', (e) => {
   console.warn('Location error:', e.message);
   alert('Could not get your location. Please ensure location services are enabled and permissions are granted.');
-  // Fallback to a default location or let user manually set location
 });
 
 map.on('locationfound', (e) => {
@@ -55,109 +63,283 @@ map.on('locationfound', (e) => {
   fetchNearby(e.latlng.lat, e.latlng.lng, 1000);
 });
 
-// Debounced bbox fetch and cache with improved error handling
+// PERFORMANCE: Optimized debounced fetch with zoom-based delays and request cancellation
 let fetchTimeout;
 const bboxCache = new Map();
-const CACHE_EXPIRE_TIME = 5 * 60 * 1000; // 5 minutes
+const CACHE_EXPIRE_TIME = 10 * 60 * 1000; // 10 minutes (longer cache)
+const MAX_CACHE_ENTRIES = 50; // Limit cache size
+
+// PERFORMANCE: Adaptive delay based on zoom level
+function getDelayForZoom(zoom) {
+  if (zoom < 12) return 2000; // 2 second delay for low zoom
+  if (zoom < 15) return 1000; // 1 second delay for medium zoom
+  return 500; // 500ms delay for high zoom
+}
+
+// PERFORMANCE: Check if bounds significantly overlap to avoid redundant requests
+function boundsOverlapSignificantly(bounds1, bounds2) {
+  if (!bounds1 || !bounds2) return false;
+  
+  const area1 = (bounds1.getNorth() - bounds1.getSouth()) * (bounds1.getEast() - bounds1.getWest());
+  const area2 = (bounds2.getNorth() - bounds2.getSouth()) * (bounds2.getEast() - bounds2.getWest());
+  
+  // If new bounds are much larger, don't consider it overlapping
+  if (area2 > area1 * 4) return false;
+  
+  const intersection = L.latLngBounds([
+    [Math.max(bounds1.getSouth(), bounds2.getSouth()), Math.max(bounds1.getWest(), bounds2.getWest())],
+    [Math.min(bounds1.getNorth(), bounds2.getNorth()), Math.min(bounds1.getEast(), bounds2.getEast())]
+  ]);
+  
+  if (!intersection.isValid()) return false;
+  
+  const intersectionArea = (intersection.getNorth() - intersection.getSouth()) * 
+                          (intersection.getEast() - intersection.getWest());
+  
+  // If intersection covers more than 70% of the smaller area, consider it overlapping
+  return intersectionArea > Math.min(area1, area2) * 0.7;
+}
 
 map.on('moveend', () => {
+  const currentZoom = map.getZoom();
+  
+  // PERFORMANCE: Skip fetching at very low zoom levels
+  if (currentZoom < MIN_ZOOM_FOR_FETCH) {
+    clearTimeout(fetchTimeout);
+    return;
+  }
+  
   clearTimeout(fetchTimeout);
+  const delay = getDelayForZoom(currentZoom);
+  
   fetchTimeout = setTimeout(() => {
-    const b = map.getBounds();
+    const bounds = map.getBounds();
+    
+    // PERFORMANCE: Check if we need to fetch based on bounds overlap
+    if (boundsOverlapSignificantly(lastFetchBounds, bounds)) {
+      return; // Skip if bounds overlap significantly
+    }
+    
+    // PERFORMANCE: Coarser cache key granularity (1 decimal place instead of 3)
     const key = [
-      b.getSouth().toFixed(3), b.getWest().toFixed(3),
-      b.getNorth().toFixed(3), b.getEast().toFixed(3)
+      bounds.getSouth().toFixed(1), bounds.getWest().toFixed(1),
+      bounds.getNorth().toFixed(1), bounds.getEast().toFixed(1)
     ].join(',');
     
     const cached = bboxCache.get(key);
     if (cached && Date.now() - cached.timestamp < CACHE_EXPIRE_TIME) {
       renderMarkers(cached.data);
-    } else {
-      fetchFountains(b, key);
+      return;
     }
-  }, 500);
+    
+    // PERFORMANCE: Limit fetch area at low zoom levels
+    const area = (bounds.getNorth() - bounds.getSouth()) * (bounds.getEast() - bounds.getWest());
+    if (area > 100) { // Very large area - reduce precision or skip
+      console.log('Area too large for efficient fetching, using cached data only');
+      return;
+    }
+    
+    fetchFountains(bounds, key);
+    lastFetchBounds = bounds;
+  }, delay);
 });
 
-// Fixed template strings and improved error handling
+// PERFORMANCE: Optimized nearby fetch with controller
 async function fetchNearby(lat, lon, radius) {
-  const query = `[out:json][timeout:15];node["amenity"="drinking_water"](around:${radius},${lat},${lon});out center;`;
+  // Cancel any existing request
+  if (currentFetchController) {
+    currentFetchController.abort();
+  }
+  
+  currentFetchController = new AbortController();
+  
+  const query = `[out:json][timeout:10];node["amenity"="drinking_water"](around:${radius},${lat},${lon});out center;`;
+  
   try {
+    showLoadingIndicator();
     const resp = await fetch('https://overpass-api.de/api/interpreter', { 
       method: 'POST', 
       body: query,
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded'
-      }
+      },
+      signal: currentFetchController.signal
     });
+    
     if (!resp.ok) throw new Error(`Overpass API error: ${resp.status}`);
     const data = await resp.json();
     renderMarkers(data.elements);
+    
   } catch (err) {
+    if (err.name === 'AbortError') {
+      console.log('Fetch cancelled');
+      return;
+    }
     console.error('Overpass radius error', err);
     showNotification('Failed to load nearby water sources. Please try again.', 'error');
+  } finally {
+    hideLoadingIndicator();
+    currentFetchController = null;
   }
 }
 
+// PERFORMANCE: Optimized bbox fetch with request cancellation and cache management
 async function fetchFountains(bounds, key) {
-  const query = `[out:json][timeout:25];(node["amenity"="drinking_water"](${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()});way["amenity"="drinking_water"](${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()});relation["amenity"="drinking_water"](${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}););out center;`;
+  // Cancel any existing request
+  if (currentFetchController) {
+    currentFetchController.abort();
+  }
+  
+  currentFetchController = new AbortController();
+  
+  // PERFORMANCE: Simplified query - only nodes, shorter timeout
+  const query = `[out:json][timeout:15];node["amenity"="drinking_water"](${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()});out;`;
   
   try {
+    showLoadingIndicator();
     const resp = await fetch('https://overpass-api.de/api/interpreter', { 
       method: 'POST', 
       body: query,
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded'
-      }
+      },
+      signal: currentFetchController.signal
     });
+    
     if (!resp.ok) throw new Error(`Overpass API error: ${resp.status}`);
     const data = await resp.json();
+    
+    // PERFORMANCE: Cache management - limit cache size
+    if (bboxCache.size >= MAX_CACHE_ENTRIES) {
+      // Remove oldest entries
+      const entries = Array.from(bboxCache.entries());
+      entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
+      const toRemove = entries.slice(0, Math.floor(MAX_CACHE_ENTRIES / 2));
+      toRemove.forEach(([key]) => bboxCache.delete(key));
+    }
+    
     bboxCache.set(key, { data: data.elements, timestamp: Date.now() });
     renderMarkers(data.elements);
+    
   } catch (err) {
+    if (err.name === 'AbortError') {
+      console.log('Fetch cancelled');
+      return;
+    }
     console.error('Overpass bbox error', err);
     showNotification('Failed to load water sources in this area. Please try again.', 'error');
+  } finally {
+    hideLoadingIndicator();
+    currentFetchController = null;
   }
 }
 
-// Improved marker rendering with better popup content
+// PERFORMANCE: Optimized marker rendering with batching and limits
 function renderMarkers(elements) {
-  markersCluster.clearLayers();
-  window._fountains = elements || [];
+  const maxMarkers = getMaxMarkersForZoom(map.getZoom());
+  const filteredElements = elements.slice(0, maxMarkers);
   
-  (elements || []).forEach((el) => {
-    const lat = el.lat ?? el.center?.lat;
-    const lon = el.lon ?? el.center?.lon;
-    if (lat == null || lon == null) return;
+  // PERFORMANCE: Clear markers efficiently
+  markersCluster.clearLayers();
+  window._fountains = filteredElements || [];
+  
+  if (!filteredElements || filteredElements.length === 0) {
+    hideLoadingIndicator();
+    return;
+  }
+  
+  // PERFORMANCE: Batch marker creation
+  const markers = [];
+  const batchSize = 100;
+  
+  function processBatch(startIndex) {
+    const endIndex = Math.min(startIndex + batchSize, filteredElements.length);
     
-    const name = el.tags?.name || 'Drinking water';
-    const operator = el.tags?.operator ? `<br><small>Operator: ${el.tags.operator}</small>` : '';
-    const access = el.tags?.access ? `<br><small>Access: ${el.tags.access}</small>` : '';
-    
-    // Calculate distance if user location is available
-    let distanceInfo = '';
-    if (userLocation) {
-      const distance = userLocation.distanceTo([lat, lon]);
-      distanceInfo = `<br><small>Distance: ${Math.round(distance)}m</small>`;
+    for (let i = startIndex; i < endIndex; i++) {
+      const el = filteredElements[i];
+      const lat = el.lat ?? el.center?.lat;
+      const lon = el.lon ?? el.center?.lon;
+      if (lat == null || lon == null) continue;
+      
+      const name = el.tags?.name || 'Drinking water';
+      const operator = el.tags?.operator ? `<br><small>Operator: ${el.tags.operator}</small>` : '';
+      const access = el.tags?.access ? `<br><small>Access: ${el.tags.access}</small>` : '';
+      
+      // PERFORMANCE: Calculate distance only when needed
+      let distanceInfo = '';
+      if (userLocation && map.getZoom() > 14) {
+        const distance = userLocation.distanceTo([lat, lon]);
+        distanceInfo = `<br><small>Distance: ${Math.round(distance)}m</small>`;
+      }
+      
+      const popupContent = `
+        <div class="fountain-popup">
+          <strong>${name}</strong>
+          ${operator}
+          ${access}
+          ${distanceInfo}
+          <br/>
+          <button class="nav-button" data-lat="${lat}" data-lon="${lon}">Navigate</button>
+        </div>
+      `;
+      
+      markers.push(L.marker([lat, lon]).bindPopup(popupContent));
     }
     
-    const popupContent = `
-      <div class="fountain-popup">
-        <strong>${name}</strong>
-        ${operator}
-        ${access}
-        ${distanceInfo}
-        <br/>
-        <button class="nav-button" data-lat="${lat}" data-lon="${lon}">Navigate</button>
-      </div>
-    `;
-    
-    markersCluster.addLayer(
-      L.marker([lat, lon]).bindPopup(popupContent)
-    );
-  });
+    if (endIndex < filteredElements.length) {
+      // Process next batch in next frame
+      requestAnimationFrame(() => processBatch(endIndex));
+    } else {
+      // Add all markers at once
+      markersCluster.addLayers(markers);
+      hideLoadingIndicator();
+    }
+  }
+  
+  // Start processing
+  processBatch(0);
 }
 
-// Navigate handler with improved URL generation
+// PERFORMANCE: Limit markers based on zoom level
+function getMaxMarkersForZoom(zoom) {
+  if (zoom < 12) return 50;
+  if (zoom < 15) return 200;
+  if (zoom < 17) return 500;
+  return 1000;
+}
+
+// PERFORMANCE: Loading indicator functions
+function showLoadingIndicator() {
+  let indicator = document.getElementById('loading-indicator');
+  if (!indicator) {
+    indicator = document.createElement('div');
+    indicator.id = 'loading-indicator';
+    indicator.textContent = 'Loading water sources...';
+    indicator.style.cssText = `
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background-color: rgba(0, 0, 0, 0.8);
+      color: white;
+      padding: 15px 25px;
+      border-radius: 8px;
+      z-index: 10002;
+      font-size: 14px;
+    `;
+    document.body.appendChild(indicator);
+  }
+  indicator.style.display = 'block';
+}
+
+function hideLoadingIndicator() {
+  const indicator = document.getElementById('loading-indicator');
+  if (indicator) {
+    indicator.style.display = 'none';
+  }
+}
+
+// Navigate handler (unchanged)
 window.navigate = (lat, lon) => {
   const isIOS = /iP(hone|od|ad)/.test(navigator.platform);
   const isAndroid = /Android/.test(navigator.userAgent);
@@ -174,7 +356,7 @@ window.navigate = (lat, lon) => {
   window.open(finalUrl, '_blank');
 };
 
-// Improved event delegation with better error handling
+// Event delegation (unchanged)
 if (document.getElementById('map')) {
   document.getElementById('map').addEventListener('click', function(event) {
     let target = event.target;
@@ -194,7 +376,7 @@ if (document.getElementById('map')) {
   });
 }
 
-// Notification system
+// Notification system (unchanged)
 function showNotification(message, type = 'info') {
   const notification = document.createElement('div');
   notification.className = `notification notification-${type}`;
@@ -218,7 +400,7 @@ function showNotification(message, type = 'info') {
   }, 5000);
 }
 
-// AR functionality with improved error handling
+// AR functionality (unchanged from original)
 const arBtn = document.getElementById('ar-button');
 const arView = document.getElementById('ar-view');
 const arVideo = document.getElementById('ar-video');
@@ -247,7 +429,6 @@ async function startARMode() {
   try {
     console.log('AR: Attempting to start AR mode.');
     
-    // Check for required APIs
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       throw new Error('Camera access not supported on this device/browser.');
     }
@@ -268,7 +449,6 @@ async function startARMode() {
     arVideo.srcObject = arStream;
     await arVideo.play();
 
-    // Request orientation permissions on iOS
     if (typeof DeviceOrientationEvent !== 'undefined' && 
         typeof DeviceOrientationEvent.requestPermission === 'function') {
       const permissionState = await DeviceOrientationEvent.requestPermission();
@@ -390,7 +570,6 @@ function drawAR(heading) {
       const dist = userLocation.distanceTo(fountainPos);
       if (dist > MAX_AR_DISTANCE) return null;
 
-      // Calculate bearing using more precise formula
       const dLon = L.Util.degToRad(lon - userLocation.lng);
       const lat1 = L.Util.degToRad(userLocation.lat);
       const lat2 = L.Util.degToRad(lat);
@@ -414,7 +593,7 @@ function drawAR(heading) {
     })
     .filter(f => f !== null && Math.abs(f.relativeAngle) <= HFOV_DEGREES / 2)
     .sort((a, b) => a.dist - b.dist)
-    .slice(0, 5); // Show up to 5 fountains
+    .slice(0, 5);
 
   const canvasCenterX = arCanvas.width / 2;
   const canvasBottomY = arCanvas.height - 80;
@@ -426,7 +605,6 @@ function drawAR(heading) {
     const screenY = canvasBottomY - (yRatio * (canvasBottomY - projectionMaxY));
     const iconRadius = 10 + (8 * yRatio);
 
-    // Draw fountain icon
     ctx.fillStyle = `rgba(0, 123, 255, ${0.7 + 0.3 * yRatio})`;
     ctx.beginPath();
     ctx.arc(screenX, screenY, iconRadius, 0, 2 * Math.PI);
@@ -436,7 +614,6 @@ function drawAR(heading) {
     ctx.lineWidth = 2;
     ctx.stroke();
 
-    // Draw distance text
     ctx.fillStyle = 'white';
     ctx.font = `bold ${12 + (4 * yRatio)}px Arial`;
     ctx.textAlign = 'center';
@@ -444,7 +621,6 @@ function drawAR(heading) {
     ctx.shadowBlur = 4;
     ctx.fillText(`${Math.round(f.dist)}m`, screenX, screenY + iconRadius + 16 + (3 * yRatio));
     
-    // Draw name for closest fountain
     if (index === 0 && f.name !== 'Drinking water') {
       ctx.font = `${10 + (2 * yRatio)}px Arial`;
       ctx.fillText(f.name, screenX, screenY + iconRadius + 32 + (3 * yRatio));
@@ -453,7 +629,6 @@ function drawAR(heading) {
     ctx.shadowBlur = 0;
   });
 
-  // Update info display
   if (arFountains.length > 0) {
     const nearest = arFountains[0];
     arInfo.textContent = `${Math.round(nearest.dist)}m to ${nearest.name}`;
@@ -495,7 +670,7 @@ document.addEventListener('DOMContentLoaded', () => {
   `;
   
   refreshBtn.addEventListener('click', () => {
-    bboxCache.clear(); // Clear cache to force refresh
+    bboxCache.clear();
     initializeLocation();
   });
   
@@ -513,16 +688,14 @@ window.addEventListener('orientationchange', () => {
   }, 100);
 });
 
-// Handle visibility changes to pause/resume AR
+// Handle visibility changes
 document.addEventListener('visibilitychange', () => {
   if (document.hidden && isARActive) {
-    // Pause AR when tab is hidden
     if (animationFrameId) {
       cancelAnimationFrame(animationFrameId);
       animationFrameId = null;
     }
   } else if (!document.hidden && isARActive) {
-    // Resume AR when tab becomes visible
     arRenderLoop();
   }
 });
